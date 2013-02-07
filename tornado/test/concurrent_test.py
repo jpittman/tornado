@@ -206,9 +206,8 @@ class ClientTestMixin(object):
     def setUp(self):
         super(ClientTestMixin, self).setUp()
         self.server = CapServer(io_loop=self.io_loop)
-        # bind_unused_port returns a tuple.  the second entry is the port number.
-        port = bind_unused_port()[1]
-        self.server.listen(port, address='127.0.0.1')
+        sock, port = bind_unused_port()
+        self.server.add_sockets([sock])
         self.client = self.client_class(io_loop=self.io_loop, port=port)
 
     def tearDown(self):
