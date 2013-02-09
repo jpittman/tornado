@@ -1137,6 +1137,158 @@ class FacebookGraphMixin(OAuth2Mixin):
         """
         return httpclient.AsyncHTTPClient()
 
+class ADNMixin(OAuth2Mixin):
+    """App.Net authentication using the ADN API and OAuth2.
+    
+    Documentation found at http://developers.app.net.
+    """
+    _OAUTH_ACCESS_TOKEN_URL = "https://account.app.net/oauth/access_token?"
+    _OAUTH_AUTHORIZE_URL = "https://account.app.net/oauth/authenticate?"
+    _OAUTH_NO_CALLBACKS = False
+
+    def get_authenticated_user(self, redirect_uri, client_id, client_secret,
+                               code, callback, extra_fields=None):
+        """Handles the login for the App.Net user, returning a user object.
+
+        Example usage::
+
+            class ADNLoginHandler(LoginHandler, tornado.auth.ADNMixin):
+              @tornado.web.asynchronous
+              def get(self):
+                  if self.get_argument("code", False):
+                      self.get_authenticated_user(
+                        redirect_uri='/auth/login/',
+                        client_id=self.settings["adn_api_key"],
+                        client_secret=self.settings["adn_secret"],
+                        code=self.get_argument("code"),
+                        callback=self.async_callback(
+                          self._on_login))
+                      return
+                  self.authorize_redirect(redirect_uri='/auth/login/',
+                                          client_id=self.settings["adn_api_key"],
+                                          extra_params={"scope": "basic,stream"})
+
+              def _on_login(self, user):
+                logging.error(user)
+                self.finish()
+
+        """
+        http = self.get_auth_http_client()
+        args = {
+            "redirect_uri": redirect_uri,
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+
+        fields = set(['id', 'name', 'first_name', 'last_name',
+                      'locale', 'picture', 'link'])
+        if extra_fields:
+            fields.update(extra_fields)
+        
+        http.fetch(self._oauth_request_token_url(**args),
+                   self.async_callback(self._on_access_token, redirect_uri, client_id,
+                                       client_secret, callback, fields))
+
+    def _on_access_token(self, redirect_uri, client_id, client_secret,
+                         callback, fields, response):
+        if response.error:
+            gen_log.warning('App.Net auth error: %s' % str(response))
+            callback(None)
+            return
+
+        args = escape.parse_qs_bytes(escape.native_str(response.body))
+        session = {
+            "access_token": args["access_token"][-1],
+            "expires": args.get("expires")
+        }
+
+        self.adn_request(
+            path="/stream/0/users/",
+            callback=self.async_callback(
+                self._on_get_user_info, callback, session, fields),
+            access_token=session["access_token"],
+            fields=",".join(fields)
+        )
+
+    def _on_get_user_info(self, callback, session, fields, user):
+        if user is None:
+            callback(None)
+            return
+
+        fieldmap = {}
+        for field in fields:
+            fieldmap[field] = user.get(field)
+
+        fieldmap.update({"access_token": session["access_token"], "session_expires": session.get("expires")})
+        callback(fieldmap)
+
+    def adn_request(self, path, callback, access_token=None,
+                         post_args=None, **args):
+        """Fetches the given relative API path, e.g., "/stream/0/posts"
+
+        If the request is a POST, post_args should be provided. Query
+        string arguments should be given as keyword arguments.
+
+        An introduction to the App.net API can be found at http://developers.app.net/
+
+        Many methods require an OAuth access token which you can obtain
+        through authorize_redirect() and get_authenticated_user(). The
+        user returned through that process includes an 'access_token'
+        attribute that can be used to make authenticated requests via
+        this method. Example usage::
+
+            class MainHandler(tornado.web.RequestHandler,
+                              tornado.auth.ADNMixin):
+                @tornado.web.authenticated
+                @tornado.web.asynchronous
+                def get(self):
+                    self.adn_request(
+                        "/stream/0/posts",
+                        post_args={"ids": "1,2,3,4"},
+                        access_token=self.current_user["access_token"],
+                        callback=self.async_callback(self._on_post))
+
+                def _on_post(self, new_entry):
+                    if not new_entry:
+                        # Call failed; perhaps missing permission?
+                        self.authorize_redirect()
+                        return
+                    self.finish("Posted a message!")
+
+        """
+        url = "https://alpha-api.app.net/" + path
+        all_args = {}
+        if access_token:
+            all_args["access_token"] = access_token
+            all_args.update(args)
+
+        if all_args:
+            url += "?" + urllib_parse.urlencode(all_args)
+        callback = self.async_callback(self._on_adn_request, callback)
+        http = self.get_auth_http_client()
+        if post_args is not None:
+            http.fetch(url, method="POST", body=urllib_parse.urlencode(post_args),
+                       callback=callback)
+        else:
+            http.fetch(url, callback=callback)
+
+    def _on_adn_request(self, callback, response):
+        if response.error:
+            gen_log.warning("Error response %s fetching %s", response.error,
+                            response.request.url)
+            callback(None)
+            return
+        callback(escape.json_decode(response.body))
+
+    def get_auth_http_client(self):
+        """Returns the AsyncHTTPClient instance to be used for auth requests.
+
+        May be overridden by subclasses to use an http client other than
+        the default.
+        """
+        return httpclient.AsyncHTTPClient()
+
 
 def _oauth_signature(consumer_token, method, url, parameters={}, token=None):
     """Calculates the HMAC-SHA1 OAuth signature for the given request.
