@@ -78,6 +78,7 @@ class MainHandler(BaseHandler, tornado.auth.ADNMixin):
             # Session may have expired
             self.redirect("/auth/login")
             return
+        logging.warning("crossing the streams") 
         self.render("stream.html", stream=stream)
 
 
