@@ -99,7 +99,8 @@ class AuthLoginHandler(BaseHandler, tornado.auth.ADNMixin):
         logging.warning("auth redirect")
         self.authorize_redirect(redirect_uri=my_url,
                                 client_id=self.settings["adn_api_key"],
-                                extra_params={"scope": "basic,stream"})
+                                extra_params={"scope": "basic,stream",
+                                              "response_type":"code"})
     
     def _on_auth(self, user):
         if not user:
