@@ -1174,11 +1174,15 @@ class ADNMixin(OAuth2Mixin):
 
         """
         http = self.get_auth_http_client()
+        
+        // TODO: Document the extra
+        extra = {"grant_type":"authorization_code"}
         args = {
             "redirect_uri": redirect_uri,
             "code": code,
             "client_id": client_id,
             "client_secret": client_secret,
+            "extra_params": extra,
         }
 
         fields = set(['id', 'name', 'first_name', 'last_name',
