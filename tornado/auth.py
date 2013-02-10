@@ -1174,25 +1174,35 @@ class ADNMixin(OAuth2Mixin):
 
         """
         http = self.get_auth_http_client()
-        
-        // TODO: Document the extra
-        extra = {"grant_type":"authorization_code"}
+
         args = {
             "redirect_uri": redirect_uri,
             "code": code,
             "client_id": client_id,
             "client_secret": client_secret,
-            "extra_params": extra,
+            "grant_type":"authorization_code",
         }
-
+        
+        # Build the body by using the concat function.  Then we remove the ?
+        # at the beginning. 
+        body = url_concat("?", args)
+        body = body[1:]
+        
+        # Left over from facebook.  May remove.
         fields = set(['id', 'name', 'first_name', 'last_name',
                       'locale', 'picture', 'link'])
         if extra_fields:
             fields.update(extra_fields)
         
-        http.fetch(self._oauth_request_token_url(**args),
-                   self.async_callback(self._on_access_token, redirect_uri, client_id,
-                                       client_secret, callback, fields))
+        # We build request object directly so that we can specify the POST method
+        # and use the body correctly.
+        request = httpclient.HTTPRequest(self._OAUTH_ACCESS_TOKEN_URL, 
+                                         method="POST", 
+                                         body=body)
+
+        http.fetch(request, self.async_callback(self._on_access_token, redirect_uri, 
+                                                client_id, client_secret, callback, 
+                                                fields))
 
     def _on_access_token(self, redirect_uri, client_id, client_secret,
                          callback, fields, response):
