@@ -1273,7 +1273,7 @@ class ADNMixin(OAuth2Mixin):
                     self.finish("Posted a message!")
 
         """
-        url = "https://alpha-api.app.net/" + path
+        url = "https://alpha-api.app.net" + path
         all_args = {}
         if access_token:
             all_args["access_token"] = access_token
