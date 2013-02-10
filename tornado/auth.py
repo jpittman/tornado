@@ -1188,12 +1188,6 @@ class ADNMixin(OAuth2Mixin):
         body = url_concat("?", args)
         body = body[1:]
         
-        # Left over from facebook.  May remove.
-        fields = set(['id', 'name', 'first_name', 'last_name',
-                      'locale', 'picture', 'link'])
-        if extra_fields:
-            fields.update(extra_fields)
-        
         # We build request object directly so that we can specify the POST method
         # and use the body correctly.
         request = httpclient.HTTPRequest(self._OAUTH_ACCESS_TOKEN_URL, 
@@ -1201,11 +1195,10 @@ class ADNMixin(OAuth2Mixin):
                                          body=body)
 
         http.fetch(request, self.async_callback(self._on_access_token, redirect_uri, 
-                                                client_id, client_secret, callback, 
-                                                fields))
+                                                client_id, client_secret, callback))
 
     def _on_access_token(self, redirect_uri, client_id, client_secret,
-                         callback, fields, response):
+                         callback, response):
         if response.error:
             gen_log.warning('App.Net auth error: %s' % str(response))
             callback(None)
@@ -1219,25 +1212,28 @@ class ADNMixin(OAuth2Mixin):
             "expires": args.get("expires")
         }
 
+        # Now that we've got the access token, let's get the data abot our user.
         self.adn_request(
             path="/stream/0/users/%d" % args['user_id'],
             callback=self.async_callback(
-                self._on_get_user_info, callback, session, fields),
+                self._on_get_user_info, callback, session),
             access_token=session["access_token"],
-            fields=",".join(fields)
         )
 
-    def _on_get_user_info(self, callback, session, fields, user):
-        if user is None:
+    def _on_get_user_info(self, callback, session, response):
+        if response is None:
             callback(None)
             return
-
-        fieldmap = {}
-        for field in fields:
-            fieldmap[field] = user.get(field)
-
-        fieldmap.update({"access_token": session["access_token"], "session_expires": session.get("expires")})
-        callback(fieldmap)
+        
+        # We assume that the returned json as a response_envelop.  More info
+        # can be found here: http://developers.app.net/docs/basics/responses/
+        # We take the json representation of the user and get a dict that we can
+        # use directory.
+        user = response['data']
+        
+        # add session info to the user dictionary.
+        user.update({"access_token": session["access_token"], "session_expires": session.get("expires")})
+        callback(user)
 
     def adn_request(self, path, callback, access_token=None,
                          post_args=None, **args):
