@@ -1210,15 +1210,17 @@ class ADNMixin(OAuth2Mixin):
             gen_log.warning('App.Net auth error: %s' % str(response))
             callback(None)
             return
-
-        args = escape.parse_qs_bytes(escape.native_str(response.body))
-        session = {
-            "access_token": args["access_token"][-1],
+        
+        # The response body here will be a json dictionary with three keys:
+        # access_token, username and user_id
+        args = escape.json_decode(response.body)
+        session = { 
+            "access_token": args["access_token"],
             "expires": args.get("expires")
         }
 
         self.adn_request(
-            path="/stream/0/users/",
+            path="/stream/0/users/%d" % args['user_id'],
             callback=self.async_callback(
                 self._on_get_user_info, callback, session, fields),
             access_token=session["access_token"],
