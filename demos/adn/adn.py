@@ -70,7 +70,7 @@ class MainHandler(BaseHandler, tornado.auth.ADNMixin):
     @tornado.web.authenticated
     @tornado.web.asynchronous
     def get(self):
-        self.adn_request("/stream/0/posts/stream/global", self._on_stream,
+        self.adn_request("/stream/0/posts/stream/unified", self._on_stream,
                          access_token=self.current_user["access_token"])
 
     def _on_stream(self, stream):
@@ -78,7 +78,6 @@ class MainHandler(BaseHandler, tornado.auth.ADNMixin):
             # Session may have expired
             self.redirect("/auth/login")
             return
-        logging.warning("crossing the streams") 
         self.render("stream.html", stream=stream)
 
 
@@ -89,7 +88,6 @@ class AuthLoginHandler(BaseHandler, tornado.auth.ADNMixin):
                   "/auth/login?next=" +
                   tornado.escape.url_escape(self.get_argument("next", "/")))
         if self.get_argument("code", False):
-            logging.warning("got code.")
             self.get_authenticated_user(
                 redirect_uri=my_url,
                 client_id=self.settings["adn_api_key"],
@@ -97,7 +95,6 @@ class AuthLoginHandler(BaseHandler, tornado.auth.ADNMixin):
                 code=self.get_argument("code"),
                 callback=self._on_auth)
             return
-        logging.warning("auth redirect")
         self.authorize_redirect(redirect_uri=my_url,
                                 client_id=self.settings["adn_api_key"],
                                 extra_params={"scope": "basic,stream",
