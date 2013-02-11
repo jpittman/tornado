@@ -1,8 +1,15 @@
-Running the Tornado Facebook example
+Running the Tornado App.Net example
 =====================================
-To work with the provided Facebook api key, this example must be
-accessed at http://localhost:8888/ to match the Connect URL set in the
-example application.
 
-To use any other domain, a new Facebook application must be registered
-with a Connect URL set to that domain.
+To get the demo running, you will need to have an ADN developer account and 
+register a new app at the following link:
+
+https://account.app.net/developer/apps/
+
+You will need to create a callback URL at creation time.  For quick testing, specify the following: 
+
+http://localhost:8888/auth/login
+
+Don't worry, you can make changes later or add additional urls.
+
+From there, just run the adn.py like any other tornado app.
