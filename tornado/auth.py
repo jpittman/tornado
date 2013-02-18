@@ -48,16 +48,19 @@ from __future__ import absolute_import, division, print_function, with_statement
 
 import base64
 import binascii
+import functools
 import hashlib
 import hmac
 import time
 import uuid
 
+from tornado.concurrent import Future, chain_future, return_future
+from tornado import gen
 from tornado import httpclient
 from tornado import escape
 from tornado.httputil import url_concat
 from tornado.log import gen_log
-from tornado.util import bytes_type, u, unicode_type
+from tornado.util import bytes_type, u, unicode_type, ArgReplacer
 
 try:
     import urlparse  # py2
@@ -69,6 +72,35 @@ try:
 except ImportError:
     import urllib as urllib_parse  # py2
 
+class AuthError(Exception):
+    pass
+
+def _auth_future_to_callback(callback, future):
+    try:
+        result = future.result()
+    except AuthError as e:
+        gen_log.warning(str(e))
+        result = None
+    callback(result)
+
+def _auth_return_future(f):
+    """Similar to tornado.concurrent.return_future, but uses the auth
+    module's legacy callback interface.
+
+    Note that when using this decorator the ``callback`` parameter
+    inside the function will actually be a future.
+    """
+    replacer = ArgReplacer(f, 'callback')
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        future = Future()
+        callback, args, kwargs = replacer.replace(future, args, kwargs)
+        if callback is not None:
+            future.add_done_callback(
+                functools.partial(_auth_future_to_callback, callback))
+        f(*args, **kwargs)
+        return future
+    return wrapper
 
 class OpenIdMixin(object):
     """Abstract implementation of OpenID and Attribute Exchange.
@@ -91,6 +123,7 @@ class OpenIdMixin(object):
         args = self._openid_args(callback_uri, ax_attrs=ax_attrs)
         self.redirect(self._OPENID_ENDPOINT + "?" + urllib_parse.urlencode(args))
 
+    @_auth_return_future
     def get_authenticated_user(self, callback, http_client=None):
         """Fetches the authenticated user data upon redirect.
 
@@ -156,11 +189,11 @@ class OpenIdMixin(object):
             })
         return args
 
-    def _on_authentication_verified(self, callback, response):
+    def _on_authentication_verified(self, future, response):
         if response.error or b"is_valid:true" not in response.body:
-            gen_log.warning("Invalid OpenID response: %s", response.error or
-                            response.body)
-            callback(None)
+            future.set_exception(AuthError(
+                    "Invalid OpenID response: %s" % (response.error or
+                                                     response.body)))
             return
 
         # Make sure we got back at least an email from attribute exchange
@@ -214,7 +247,7 @@ class OpenIdMixin(object):
         claimed_id = self.get_argument("openid.claimed_id", None)
         if claimed_id:
             user["claimed_id"] = claimed_id
-        callback(user)
+        future.set_result(user)
 
     def get_auth_http_client(self):
         """Returns the AsyncHTTPClient instance to be used for auth requests.
@@ -264,6 +297,7 @@ class OAuthMixin(object):
                     self._on_request_token, self._OAUTH_AUTHORIZE_URL,
                     callback_uri))
 
+    @_auth_return_future
     def get_authenticated_user(self, callback, http_client=None):
         """Gets the OAuth authorized user and access token on callback.
 
@@ -275,19 +309,19 @@ class OAuthMixin(object):
         to this service on behalf of the user.
 
         """
+        future = callback
         request_key = escape.utf8(self.get_argument("oauth_token"))
         oauth_verifier = self.get_argument("oauth_verifier", None)
         request_cookie = self.get_cookie("_oauth_request_token")
         if not request_cookie:
-            gen_log.warning("Missing OAuth request token cookie")
-            callback(None)
+            future.set_exception(AuthError(
+                    "Missing OAuth request token cookie"))
             return
         self.clear_cookie("_oauth_request_token")
         cookie_key, cookie_secret = [base64.b64decode(escape.utf8(i)) for i in request_cookie.split("|")]
         if cookie_key != request_key:
-            gen_log.info((cookie_key, request_key, request_cookie))
-            gen_log.warning("Request token does not match cookie")
-            callback(None)
+            future.set_exception(AuthError(
+                    "Request token does not match cookie"))
             return
         token = dict(key=cookie_key, secret=cookie_secret)
         if oauth_verifier:
@@ -362,25 +396,34 @@ class OAuthMixin(object):
         args["oauth_signature"] = signature
         return url + "?" + urllib_parse.urlencode(args)
 
-    def _on_access_token(self, callback, response):
+    def _on_access_token(self, future, response):
         if response.error:
-            gen_log.warning("Could not fetch access token")
-            callback(None)
+            future.set_exception(AuthError("Could not fetch access token"))
             return
 
         access_token = _oauth_parse_response(response.body)
-        self._oauth_get_user(access_token, self.async_callback(
-                             self._on_oauth_get_user, access_token, callback))
+        self._oauth_get_user_future(access_token).add_done_callback(
+            self.async_callback(self._on_oauth_get_user, access_token, future))
+
+    @return_future
+    def _oauth_get_user_future(self, access_token, callback):
+        # By default, call the old-style _oauth_get_user, but new code
+        # should override this method instead.
+        self._oauth_get_user(access_token, callback)
 
     def _oauth_get_user(self, access_token, callback):
         raise NotImplementedError()
 
-    def _on_oauth_get_user(self, access_token, callback, user):
+    def _on_oauth_get_user(self, access_token, future, user_future):
+        if user_future.exception() is not None:
+            future.set_exception(user_future.exception())
+            return
+        user = user_future.result()
         if not user:
-            callback(None)
+            future.set_exception(AuthError("Error getting user"))
             return
         user["access_token"] = access_token
-        callback(user)
+        future.set_result(user)
 
     def _oauth_request_parameters(self, url, access_token, parameters={},
                                   method="GET"):
@@ -507,7 +550,8 @@ class TwitterMixin(OAuthMixin):
         http.fetch(self._oauth_request_token_url(callback_uri=callback_uri), self.async_callback(
             self._on_request_token, self._OAUTH_AUTHENTICATE_URL, None))
 
-    def twitter_request(self, path, callback, access_token=None,
+    @_auth_return_future
+    def twitter_request(self, path, callback=None, access_token=None,
                         post_args=None, **args):
         """Fetches the given API path, e.g., "/statuses/user_timeline/btaylor"
 
@@ -562,21 +606,21 @@ class TwitterMixin(OAuthMixin):
             args.update(oauth)
         if args:
             url += "?" + urllib_parse.urlencode(args)
-        callback = self.async_callback(self._on_twitter_request, callback)
         http = self.get_auth_http_client()
+        http_callback = self.async_callback(self._on_twitter_request, callback)
         if post_args is not None:
             http.fetch(url, method="POST", body=urllib_parse.urlencode(post_args),
-                       callback=callback)
+                       callback=http_callback)
         else:
-            http.fetch(url, callback=callback)
+            http.fetch(url, callback=http_callback)
 
-    def _on_twitter_request(self, callback, response):
+    def _on_twitter_request(self, future, response):
         if response.error:
-            gen_log.warning("Error response %s fetching %s", response.error,
-                            response.request.url)
-            callback(None)
+            future.set_exception(AuthError(
+                    "Error response %s fetching %s" % (response.error,
+                                                       response.request.url)))
             return
-        callback(escape.json_decode(response.body))
+        future.set_result(escape.json_decode(response.body))
 
     def _oauth_consumer_token(self):
         self.require_setting("twitter_consumer_key", "Twitter OAuth")
@@ -585,13 +629,12 @@ class TwitterMixin(OAuthMixin):
             key=self.settings["twitter_consumer_key"],
             secret=self.settings["twitter_consumer_secret"])
 
-    def _oauth_get_user(self, access_token, callback):
-        callback = self.async_callback(self._parse_user_response, callback)
-        self.twitter_request(
+    @return_future
+    @gen.engine
+    def _oauth_get_user_future(self, access_token, callback):
+        user = yield self.twitter_request(
             "/users/show/" + escape.native_str(access_token[b"screen_name"]),
-            access_token=access_token, callback=callback)
-
-    def _parse_user_response(self, callback, user):
+            access_token=access_token)
         if user:
             user["username"] = user["screen_name"]
         callback(user)
@@ -637,6 +680,7 @@ class FriendFeedMixin(OAuthMixin):
     _OAUTH_NO_CALLBACKS = True
     _OAUTH_VERSION = "1.0"
 
+    @_auth_return_future
     def friendfeed_request(self, path, callback, access_token=None,
                            post_args=None, **args):
         """Fetches the given relative API path, e.g., "/bret/friends"
@@ -692,13 +736,13 @@ class FriendFeedMixin(OAuthMixin):
         else:
             http.fetch(url, callback=callback)
 
-    def _on_friendfeed_request(self, callback, response):
+    def _on_friendfeed_request(self, future, response):
         if response.error:
-            gen_log.warning("Error response %s fetching %s", response.error,
-                            response.request.url)
-            callback(None)
+            future.set_exception(AuthError(
+                    "Error response %s fetching %s" % (response.error,
+                                                       response.request.url)))
             return
-        callback(escape.json_decode(response.body))
+        future.set_result(escape.json_decode(response.body))
 
     def _oauth_consumer_token(self):
         self.require_setting("friendfeed_consumer_key", "FriendFeed OAuth")
@@ -707,12 +751,15 @@ class FriendFeedMixin(OAuthMixin):
             key=self.settings["friendfeed_consumer_key"],
             secret=self.settings["friendfeed_consumer_secret"])
 
+    @return_future
+    @gen.engine
     def _oauth_get_user(self, access_token, callback):
-        callback = self.async_callback(self._parse_user_response, callback)
-        self.friendfeed_request(
+        user = yield self.friendfeed_request(
             "/feedinfo/" + access_token["username"],
-            include="id,name,description", access_token=access_token,
-            callback=callback)
+            include="id,name,description", access_token=access_token)
+        if user:
+            user["username"] = user["id"]
+        callback(user)
 
     def _parse_user_response(self, callback, user):
         if user:
@@ -765,6 +812,7 @@ class GoogleMixin(OpenIdMixin, OAuthMixin):
                                  oauth_scope=oauth_scope)
         self.redirect(self._OPENID_ENDPOINT + "?" + urllib_parse.urlencode(args))
 
+    @_auth_return_future
     def get_authenticated_user(self, callback):
         """Fetches the authenticated user data upon redirect."""
         # Look to see if we are doing combined OpenID/OAuth
@@ -781,7 +829,8 @@ class GoogleMixin(OpenIdMixin, OAuthMixin):
             http.fetch(self._oauth_access_token_url(token),
                        self.async_callback(self._on_access_token, callback))
         else:
-            OpenIdMixin.get_authenticated_user(self, callback)
+            chain_future(OpenIdMixin.get_authenticated_user(self),
+                         callback)
 
     def _oauth_consumer_token(self):
         self.require_setting("google_consumer_key", "Google OAuth")
@@ -790,15 +839,16 @@ class GoogleMixin(OpenIdMixin, OAuthMixin):
             key=self.settings["google_consumer_key"],
             secret=self.settings["google_consumer_secret"])
 
-    def _oauth_get_user(self, access_token, callback):
-        OpenIdMixin.get_authenticated_user(self, callback)
+    def _oauth_get_user_future(self, access_token, callback):
+        return OpenIdMixin.get_authenticated_user(self)
 
 
 class FacebookMixin(object):
     """Facebook Connect authentication.
 
-    New applications should consider using `FacebookGraphMixin` below instead
-    of this class.
+    *Deprecated:* New applications should use `FacebookGraphMixin`
+    below instead of this class.  This class does not support the
+    Future-based interface seen on other classes in this module.
 
     To authenticate with Facebook, register your application with
     Facebook at http://www.facebook.com/developers/apps.php. Then

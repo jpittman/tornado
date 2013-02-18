@@ -34,6 +34,7 @@ from __future__ import absolute_import, division, print_function, with_statement
 import time
 import weakref
 
+from tornado.concurrent import Future
 from tornado.escape import utf8
 from tornado import httputil, stack_context
 from tornado.ioloop import IOLoop
@@ -144,6 +145,12 @@ class AsyncHTTPClient(Configurable):
             cls._async_clients()[io_loop] = instance
         return instance
 
+    def initialize(self, io_loop, defaults=None):
+        self.io_loop = io_loop
+        self.defaults = dict(HTTPRequest._DEFAULTS)
+        if defaults is not None:
+            self.defaults.update(defaults)
+
     def close(self):
         """Destroys this http client, freeing any file descriptors used.
         Not needed in normal use, but may be helpful in unittests that
@@ -153,7 +160,7 @@ class AsyncHTTPClient(Configurable):
         if self._async_clients().get(self.io_loop) is self:
             del self._async_clients()[self.io_loop]
 
-    def fetch(self, request, callback, **kwargs):
+    def fetch(self, request, callback=None, **kwargs):
         """Executes a request, calling callback with an `HTTPResponse`.
 
         The request may be either a string URL or an `HTTPRequest` object.
@@ -165,6 +172,37 @@ class AsyncHTTPClient(Configurable):
         encountered during the request. You can call response.rethrow() to
         throw the exception (if any) in the callback.
         """
+        if not isinstance(request, HTTPRequest):
+            request = HTTPRequest(url=request, **kwargs)
+        # We may modify this (to add Host, Accept-Encoding, etc),
+        # so make sure we don't modify the caller's object.  This is also
+        # where normal dicts get converted to HTTPHeaders objects.
+        request.headers = httputil.HTTPHeaders(request.headers)
+        request = _RequestProxy(request, self.defaults)
+        future = Future()
+        if callback is not None:
+            callback = stack_context.wrap(callback)
+            def handle_future(future):
+                exc = future.exception()
+                if isinstance(exc, HTTPError) and exc.response is not None:
+                    response = exc.response
+                elif exc is not None:
+                    response = HTTPResponse(
+                        request, 599, error=exc,
+                        request_time=time.time() - request.start_time)
+                else:
+                    response = future.result()
+                self.io_loop.add_callback(callback, response)
+            future.add_done_callback(handle_future)
+        def handle_response(response):
+            if response.error:
+                future.set_exception(response.error)
+            else:
+                future.set_result(response)
+        self.fetch_impl(request, handle_response)
+        return future
+
+    def fetch_impl(self, request, callback):
         raise NotImplementedError()
 
     @classmethod

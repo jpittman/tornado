@@ -5,7 +5,7 @@ from tornado.escape import utf8, _unicode, native_str
 from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError, AsyncHTTPClient, main, _RequestProxy
 from tornado.httputil import HTTPHeaders
 from tornado.iostream import IOStream, SSLIOStream
-from tornado.netutil import Resolver
+from tornado.netutil import Resolver, OverrideResolver
 from tornado.log import gen_log
 from tornado import stack_context
 from tornado.util import GzipDecompressor
@@ -45,7 +45,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     are not reused, and callers cannot select the network interface to be
     used.
     """
-    def initialize(self, io_loop=None, max_clients=10,
+    def initialize(self, io_loop, max_clients=10,
                    hostname_mapping=None, max_buffer_size=104857600,
                    resolver=None, defaults=None):
         """Creates a AsyncHTTPClient.
@@ -67,26 +67,18 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         max_buffer_size is the number of bytes that can be read by IOStream. It
         defaults to 100mb.
         """
-        self.io_loop = io_loop
+        super(SimpleAsyncHTTPClient, self).initialize(io_loop,
+                                                      defaults=defaults)
         self.max_clients = max_clients
         self.queue = collections.deque()
         self.active = {}
-        self.hostname_mapping = hostname_mapping
         self.max_buffer_size = max_buffer_size
         self.resolver = resolver or Resolver(io_loop=io_loop)
-        self.defaults = dict(HTTPRequest._DEFAULTS)
-        if defaults is not None:
-            self.defaults.update(defaults)
+        if hostname_mapping is not None:
+            self.resolver = OverrideResolver(resolver=self.resolver,
+                                             mapping=hostname_mapping)
 
-    def fetch(self, request, callback, **kwargs):
-        if not isinstance(request, HTTPRequest):
-            request = HTTPRequest(url=request, **kwargs)
-        # We're going to modify this (to add Host, Accept-Encoding, etc),
-        # so make sure we don't modify the caller's object.  This is also
-        # where normal dicts get converted to HTTPHeaders objects.
-        request.headers = HTTPHeaders(request.headers)
-        request = _RequestProxy(request, self.defaults)
-        callback = stack_context.wrap(callback)
+    def fetch_impl(self, request, callback):
         self.queue.append((request, callback))
         self._process_queue()
         if self.queue:
@@ -103,7 +95,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 _HTTPConnection(self.io_loop, self, request,
                                 functools.partial(self._release_fetch, key),
                                 callback,
-                                self.max_buffer_size)
+                                self.max_buffer_size, self.resolver)
 
     def _release_fetch(self, key):
         del self.active[key]
@@ -114,7 +106,7 @@ class _HTTPConnection(object):
     _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 
     def __init__(self, io_loop, client, request, release_callback,
-                 final_callback, max_buffer_size):
+                 final_callback, max_buffer_size, resolver):
         self.start_time = io_loop.time()
         self.io_loop = io_loop
         self.client = client
@@ -122,6 +114,7 @@ class _HTTPConnection(object):
         self.release_callback = release_callback
         self.final_callback = final_callback
         self.max_buffer_size = max_buffer_size
+        self.resolver = resolver
         self.code = None
         self.headers = None
         self.chunks = None
@@ -149,8 +142,6 @@ class _HTTPConnection(object):
                 # raw ipv6 addresses in urls are enclosed in brackets
                 host = host[1:-1]
             self.parsed_hostname = host  # save final host for _on_connect
-            if self.client.hostname_mapping is not None:
-                host = self.client.hostname_mapping.get(host, host)
 
             if request.allow_ipv6:
                 af = socket.AF_UNSPEC
@@ -159,7 +150,7 @@ class _HTTPConnection(object):
                 # so restrict to ipv4 by default.
                 af = socket.AF_INET
 
-            self.client.resolver.getaddrinfo(
+            self.resolver.getaddrinfo(
                 host, port, af, socket.SOCK_STREAM, 0, 0,
                 callback=self._on_resolve)
 
@@ -321,19 +312,22 @@ class _HTTPConnection(object):
                 message = str(self.stream.error)
             raise HTTPError(599, message)
 
+    def _handle_1xx(self, code):
+        self.stream.read_until_regex(b"\r?\n\r?\n", self._on_headers)
+
     def _on_headers(self, data):
         data = native_str(data.decode("latin1"))
         first_line, _, header_data = data.partition("\n")
         match = re.match("HTTP/1.[01] ([0-9]+) ([^\r]*)", first_line)
         assert match
         code = int(match.group(1))
+        self.headers = HTTPHeaders.parse(header_data)
         if 100 <= code < 200:
-            self.stream.read_until_regex(b"\r?\n\r?\n", self._on_headers)
+            self._handle_1xx(code)
             return
         else:
             self.code = code
             self.reason = match.group(2)
-        self.headers = HTTPHeaders.parse(header_data)
 
         if "Content-Length" in self.headers:
             if "," in self.headers["Content-Length"]:

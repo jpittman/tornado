@@ -28,6 +28,7 @@ import stat
 from tornado.concurrent import dummy_executor, run_on_executor
 from tornado.ioloop import IOLoop
 from tornado.platform.auto import set_close_exec
+from tornado.util import Configurable
 
 
 def bind_sockets(port, address=None, family=socket.AF_UNSPEC, backlog=128, flags=None):
@@ -141,14 +142,68 @@ def add_accept_handler(sock, callback, io_loop=None):
     io_loop.add_handler(sock.fileno(), accept_handler, IOLoop.READ)
 
 
-class Resolver(object):
-    def __init__(self, io_loop=None, executor=None):
+class Resolver(Configurable):
+    @classmethod
+    def configurable_base(cls):
+        return Resolver
+
+    @classmethod
+    def configurable_default(cls):
+        return BlockingResolver
+
+    def getaddrinfo(self, *args, **kwargs):
+        """Resolves an address.
+
+        The arguments to this function are the same as to
+        `socket.getaddrinfo`, with the addition of an optional
+        keyword-only ``callback`` argument.
+
+        Returns a `Future` whose result is the same as the return
+        value of `socket.getaddrinfo`.  If a callback is passed,
+        it will be run with the `Future` as an argument when it
+        is complete.
+        """
+        raise NotImplementedError()
+
+
+class ExecutorResolver(Resolver):
+    def initialize(self, io_loop=None, executor=None):
         self.io_loop = io_loop or IOLoop.instance()
         self.executor = executor or dummy_executor
 
     @run_on_executor
     def getaddrinfo(self, *args, **kwargs):
         return socket.getaddrinfo(*args, **kwargs)
+
+class BlockingResolver(ExecutorResolver):
+    def initialize(self, io_loop=None):
+        super(BlockingResolver, self).initialize(io_loop=io_loop)
+
+class ThreadedResolver(ExecutorResolver):
+    def initialize(self, io_loop=None, num_threads=10):
+        from concurrent.futures import ThreadPoolExecutor
+        super(ThreadedResolver, self).initialize(
+            io_loop=io_loop, executor=ThreadPoolExecutor(num_threads))
+
+class OverrideResolver(Resolver):
+    """Wraps a resolver with a mapping of overrides.
+
+    This can be used to make local DNS changes (e.g. for testing)
+    without modifying system-wide settings.
+
+    The mapping can contain either host strings or host-port pairs.
+    """
+    def initialize(self, resolver, mapping):
+        self.resolver = resolver
+        self.mapping = mapping
+
+    def getaddrinfo(self, host, port, *args, **kwargs):
+        if (host, port) in self.mapping:
+            host, port = self.mapping[(host, port)]
+        elif host in self.mapping:
+            host = self.mapping[host]
+        return self.resolver.getaddrinfo(host, port, *args, **kwargs)
+
 
 
 # These are the keyword arguments to ssl.wrap_socket that must be translated
